@@ -38,6 +38,30 @@ import sys
 from pathlib import Path
 
 
+ACTION_LAYOUT_TO_DIM = {
+    "hsr11": 11,
+    "arm5": 5,
+}
+
+
+def build_layout_overrides(action_layout: str, action_dim: int = None):
+    """Return extra lerobot-train overrides for action layout.
+
+    Default HSR11 path returns no overrides and preserves current behavior.
+    For non-default layouts this remains a hook so model and dataset override
+    keys can be passed explicitly with --policy-override.
+    """
+    resolved_dim = action_dim if action_dim is not None else ACTION_LAYOUT_TO_DIM[action_layout]
+    if action_layout == "hsr11" and resolved_dim == 11:
+        return []
+
+    print("WARNING: Non-default action layout requested: "
+          f"layout={action_layout}, action_dim={resolved_dim}.")
+    print("WARNING: Verify the exact LeRobot override keys for your version. "
+          "Use --policy-override to pass validated keys.")
+    return []
+
+
 def validate_dataset(root: Path):
     info_path = root / "meta" / "info.json"
     if not info_path.exists():
@@ -66,6 +90,13 @@ def main():
     parser.add_argument("--save-freq", type=int, default=1000)
     parser.add_argument("--log-freq", type=int, default=100)
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--action-layout", type=str, default="hsr11",
+                        choices=sorted(ACTION_LAYOUT_TO_DIM.keys()),
+                        help="Action layout preset. hsr11 keeps current behavior.")
+    parser.add_argument("--action-dim", type=int, default=None,
+                        help="Optional explicit action dimension override.")
+    parser.add_argument("--policy-override", action="append", default=[],
+                        help="Extra raw lerobot-train overrides, repeatable.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -98,6 +129,9 @@ def main():
     ]
     if not args.no_amp:
         cmd.append("--policy.use_amp=true")
+
+    cmd.extend(build_layout_overrides(args.action_layout, args.action_dim))
+    cmd.extend(args.policy_override)
 
     if args.dry_run:
         print("\nWould run:\n " + " \\\n  ".join(cmd))

@@ -40,13 +40,16 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-# HSR 11D action layout. Order matches both the dataset and the policy output.
-# Do not reorder without re-checking the dataset stats.
-ACTION_GROUPS = {
-    "arm":     slice(0, 5),   # arm_lift, arm_flex, arm_roll, wrist_flex, wrist_roll
-    "gripper": slice(5, 6),   # binary open/close
-    "head":    slice(6, 8),   # head_pan, head_tilt
-    "base":    slice(8, 11),  # base_x, base_y, base_theta (holonomic)
+ACTION_LAYOUT_TO_GROUPS = {
+    "hsr11": {
+        "arm": slice(0, 5),
+        "gripper": slice(5, 6),
+        "head": slice(6, 8),
+        "base": slice(8, 11),
+    },
+    "arm5": {
+        "arm": slice(0, 5),
+    },
 }
 
 # Episodes flagged as corrupt during dataset preparation. Excluded from splits
@@ -67,7 +70,7 @@ def split_episodes(episodes_parquet, task_filter=None, test_ratio=0.1, seed=42):
         ep = ep[ep["task_name"].isin(task_filter)]
 
     if "task_success" in ep.columns:
-        ep = ep[ep["task_success"] == True]
+        ep = ep[ep["task_success"]]
 
     indices = sorted(ep["episode_index"].astype(int).tolist())
     indices = [i for i in indices if i not in CORRUPT_EPISODES]
@@ -81,14 +84,29 @@ def split_episodes(episodes_parquet, task_filter=None, test_ratio=0.1, seed=42):
     return train_eps, test_eps
 
 
+def resolve_action_groups(action_layout: str):
+    if action_layout not in ACTION_LAYOUT_TO_GROUPS:
+        raise ValueError(
+            "Unknown action layout '{}'. Expected one of {}".format(
+                action_layout, sorted(ACTION_LAYOUT_TO_GROUPS.keys())
+            )
+        )
+    return ACTION_LAYOUT_TO_GROUPS[action_layout]
+
+
 def evaluate(checkpoint_path, dataset_root, test_episodes, n_samples=240,
-             repo_id="local/dataset", device="cuda"):
+             repo_id="local/dataset", device="cuda", action_layout="hsr11",
+             action_dim=None):
     """Run a checkpoint over a fixed grid of frames and return per-group MSE."""
     # Imports are local so the module loads without lerobot installed
     # (e.g. when only the helpers above are used from a notebook).
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     from lerobot.policies.factory import make_pre_post_processors
+
+    action_groups = resolve_action_groups(action_layout)
+    if action_dim is None:
+        action_dim = max(s.stop for s in action_groups.values())
 
     dataset = LeRobotDataset(
         repo_id=repo_id,
@@ -118,30 +136,32 @@ def evaluate(checkpoint_path, dataset_root, test_episodes, n_samples=240,
     sample_indices = np.linspace(0, total_frames - 1, n_samples, dtype=int)
 
     all_mse = []
-    per_group = {name: [] for name in ACTION_GROUPS}
+    per_group = {name: [] for name in action_groups}
 
     with torch.no_grad():
         for idx in tqdm(sample_indices, desc=Path(checkpoint_path).parent.name):
             frame = dataset[int(idx)]
-            gt_action = frame["action"].clone()  # (11,), normalized
+            gt_action = frame["action"].clone()  # (action_dim,), normalized
 
             batch = preprocessor(frame)
-            pred_chunk = policy.predict_action_chunk(batch)  # (1, T, 11)
-            pred_first = pred_chunk[0, 0, :11].cpu()
+            pred_chunk = policy.predict_action_chunk(batch)  # (1, T, action_dim)
+            pred_first = pred_chunk[0, 0, :action_dim].cpu()
 
-            error = (pred_first - gt_action[:11]) ** 2
+            error = (pred_first - gt_action[:action_dim]) ** 2
             all_mse.append(error.mean().item())
-            for name, slc in ACTION_GROUPS.items():
+            for name, slc in action_groups.items():
                 per_group[name].append(error[slc].mean().item())
 
     results = {
         "checkpoint": str(checkpoint_path),
         "n_samples": int(n_samples),
         "n_test_episodes": len(test_episodes),
+        "action_layout": action_layout,
+        "action_dim": int(action_dim),
         "mse_total": float(np.mean(all_mse)),
         "mse_total_std": float(np.std(all_mse)),
     }
-    for name in ACTION_GROUPS:
+    for name in action_groups:
         results[f"mse_{name}"] = float(np.mean(per_group[name]))
 
     del policy
@@ -156,8 +176,11 @@ def print_table(results_by_name):
     print("-" * 72)
     ordered = sorted(results_by_name.items(), key=lambda kv: kv[1]["mse_total"])
     for name, r in ordered:
+        grip = r.get("mse_gripper", float("nan"))
+        head = r.get("mse_head", float("nan"))
+        base = r.get("mse_base", float("nan"))
         print(f"{name:<24} {r['mse_total']:>9.4f} {r['mse_arm']:>9.4f} "
-              f"{r['mse_gripper']:>9.4f} {r['mse_head']:>9.4f} {r['mse_base']:>9.4f}")
+              f"{grip:>9.4f} {head:>9.4f} {base:>9.4f}")
     print()
 
 
@@ -177,6 +200,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-samples", type=int, default=240)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--action-layout", type=str, default="hsr11",
+                        choices=sorted(ACTION_LAYOUT_TO_GROUPS.keys()),
+                        help="Action layout preset used for slicing output and metrics.")
+    parser.add_argument("--action-dim", type=int, default=None,
+                        help="Optional explicit action dimension override.")
     parser.add_argument("--output", type=str, default=None,
                         help="Path to a JSON file to write results to")
     args = parser.parse_args()
@@ -217,6 +245,8 @@ def main():
                 n_samples=args.n_samples,
                 repo_id=args.repo_id,
                 device=args.device,
+                action_layout=args.action_layout,
+                action_dim=args.action_dim,
             )
         except Exception as e:
             print(f"  FAILED on {name}: {e}")

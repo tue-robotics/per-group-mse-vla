@@ -54,8 +54,12 @@ from safetensors import safe_open
 
 LOG = logging.getLogger("policy_server")
 
-# Mirrors eval/per_group_mse.py and matches the dataset layout.
-ACTION_DIM = 11
+# Mirrors eval/per_group_mse.py and matches the default dataset layout.
+DEFAULT_ACTION_LAYOUT = "hsr11"
+ACTION_LAYOUT_TO_DIM = {
+    "hsr11": 11,
+    "arm5": 5,
+}
 STATE_DIM = 8
 
 # Tokenizer's attention_mask comes back as int64 on this code path.
@@ -89,6 +93,18 @@ def load_norm_stats(checkpoint_dir: Path):
     return stats
 
 
+def resolve_action_dim(action_layout: str, action_dim: int = None) -> int:
+    if action_dim is not None:
+        return int(action_dim)
+    if action_layout not in ACTION_LAYOUT_TO_DIM:
+        raise ValueError(
+            "Unknown action layout '{}'. Expected one of {}".format(
+                action_layout, sorted(ACTION_LAYOUT_TO_DIM.keys())
+            )
+        )
+    return ACTION_LAYOUT_TO_DIM[action_layout]
+
+
 def normalize_state(state: np.ndarray, stats: dict) -> np.ndarray:
     """Apply mean/std normalization to the 8-D state vector.
 
@@ -103,12 +119,14 @@ def normalize_state(state: np.ndarray, stats: dict) -> np.ndarray:
     raise KeyError("Norm stats for the state vector not found in the checkpoint.")
 
 
-def unnormalize_action(action: np.ndarray, stats: dict) -> np.ndarray:
+def unnormalize_action(action: np.ndarray, stats: dict, action_dim: int) -> np.ndarray:
     """Undo the same transform on the predicted action chunk."""
     if "action_mean" in stats and "action_std" in stats:
-        return action * stats["action_std"] + stats["action_mean"]
+        mean = stats["action_mean"][:action_dim]
+        std = stats["action_std"][:action_dim]
+        return action * std + mean
     if "action_q01" in stats and "action_q99" in stats:
-        q01, q99 = stats["action_q01"], stats["action_q99"]
+        q01, q99 = stats["action_q01"][:action_dim], stats["action_q99"][:action_dim]
         return ((action + 1.0) / 2.0) * (q99 - q01) + q01
     raise KeyError("Norm stats for the action vector not found in the checkpoint.")
 
@@ -119,7 +137,8 @@ def _img_to_tensor(img: np.ndarray, device: str) -> torch.Tensor:
 
 
 class Server:
-    def __init__(self, checkpoint_dir: Path, device: str = "cuda"):
+    def __init__(self, checkpoint_dir: Path, device: str = "cuda",
+                 action_layout: str = DEFAULT_ACTION_LAYOUT, action_dim: int = None):
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
         from transformers import AutoTokenizer
 
@@ -128,11 +147,14 @@ class Server:
         self.policy.eval().to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir))
         self.stats = load_norm_stats(checkpoint_dir)
-        LOG.info("Policy server ready on %s", device)
+        self.action_layout = action_layout
+        self.action_dim = resolve_action_dim(action_layout, action_dim)
+        LOG.info("Policy server ready on %s with action_layout=%s action_dim=%d",
+             device, self.action_layout, self.action_dim)
 
     @torch.no_grad()
     def infer(self, obs: dict) -> np.ndarray:
-        """One forward pass. Returns (T, 11) float32 in robot units."""
+        """One forward pass. Returns (T, action_dim) float32 in robot units."""
         head_rgb = np.asarray(obs["head_rgb"], dtype=np.uint8)
         hand_rgb = np.asarray(obs["hand_rgb"], dtype=np.uint8)
         state = np.asarray(obs["state"], dtype=np.float32)
@@ -156,11 +178,11 @@ class Server:
         }
 
         # predict_action_chunk returns (1, T, action_dim). Slicing to
-        # ACTION_DIM is defensive in case the policy was trained with
+        # self.action_dim is defensive in case the policy was trained with
         # padded actions.
         pred = self.policy.predict_action_chunk(batch)
-        chunk_norm = pred[0, :, :ACTION_DIM].cpu().numpy()
-        return unnormalize_action(chunk_norm, self.stats).astype(np.float32)
+        chunk_norm = pred[0, :, :self.action_dim].cpu().numpy()
+        return unnormalize_action(chunk_norm, self.stats, self.action_dim).astype(np.float32)
 
 
 async def handle(ws, server: Server):
@@ -179,8 +201,14 @@ async def handle(ws, server: Server):
             await ws.send(msgpack.packb({"error": str(e)}, use_bin_type=True))
 
 
-async def serve(checkpoint_dir: Path, host: str, port: int, device: str):
-    server = Server(checkpoint_dir, device=device)
+async def serve(checkpoint_dir: Path, host: str, port: int, device: str,
+                action_layout: str, action_dim: int = None):
+    server = Server(
+        checkpoint_dir,
+        device=device,
+        action_layout=action_layout,
+        action_dim=action_dim,
+    )
     # 20 MB cap on incoming payloads. A pair of 480x640x3 uint8 frames is
     # ~1.8 MB raw, msgpack-packed lists are bigger but well below 20 MB.
     async with websockets.serve(lambda ws: handle(ws, server), host, port,
@@ -196,6 +224,11 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--action-layout", type=str, default=DEFAULT_ACTION_LAYOUT,
+                        choices=sorted(ACTION_LAYOUT_TO_DIM.keys()),
+                        help="Action layout preset. hsr11 is default, arm5 keeps only arm joints.")
+    parser.add_argument("--action-dim", type=int, default=None,
+                        help="Optional explicit action dimension override.")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -203,7 +236,16 @@ def main():
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
     )
-    asyncio.run(serve(Path(args.checkpoint), args.host, args.port, args.device))
+    asyncio.run(
+        serve(
+            Path(args.checkpoint),
+            args.host,
+            args.port,
+            args.device,
+            args.action_layout,
+            args.action_dim,
+        )
+    )
 
 
 if __name__ == "__main__":

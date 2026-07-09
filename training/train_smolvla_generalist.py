@@ -34,6 +34,30 @@ import sys
 from pathlib import Path
 
 
+ACTION_LAYOUT_TO_DIM = {
+    "hsr11": 11,
+    "arm5": 5,
+}
+
+
+def build_layout_overrides(action_layout: str, action_dim: int = None):
+    """Return extra lerobot-train overrides for action layout.
+
+    Default HSR11 path returns no overrides and preserves current behavior.
+    For non-default layouts this is intentionally conservative because exact
+    override keys can differ across LeRobot versions.
+    """
+    resolved_dim = action_dim if action_dim is not None else ACTION_LAYOUT_TO_DIM[action_layout]
+    if action_layout == "hsr11" and resolved_dim == 11:
+        return []
+
+    print("WARNING: Non-default action layout requested: "
+          f"layout={action_layout}, action_dim={resolved_dim}.")
+    print("WARNING: Verify the exact LeRobot override keys for your version. "
+          "Use --policy-override to pass validated keys.")
+    return []
+
+
 def validate_dataset(root: Path):
     """Light sanity check on the LeRobot v3.0 dataset before launching."""
     info_path = root / "meta" / "info.json"
@@ -71,6 +95,13 @@ def main():
                         help="Disable mixed precision (uses ~2x VRAM)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from a previous checkpoint (pretrained_model dir)")
+    parser.add_argument("--action-layout", type=str, default="hsr11",
+                        choices=sorted(ACTION_LAYOUT_TO_DIM.keys()),
+                        help="Action layout preset. hsr11 keeps current behavior.")
+    parser.add_argument("--action-dim", type=int, default=None,
+                        help="Optional explicit action dimension override.")
+    parser.add_argument("--policy-override", action="append", default=[],
+                        help="Extra raw lerobot-train overrides, repeatable.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the lerobot-train command and exit")
     args = parser.parse_args()
@@ -102,6 +133,9 @@ def main():
     ]
     if not args.no_amp:
         cmd.append("--policy.use_amp=true")
+
+    cmd.extend(build_layout_overrides(args.action_layout, args.action_dim))
+    cmd.extend(args.policy_override)
 
     if args.dry_run:
         print("\nWould run:\n " + " \\\n  ".join(cmd))
