@@ -58,7 +58,7 @@ LOG = logging.getLogger("policy_server")
 DEFAULT_ACTION_LAYOUT = "hsr11"
 ACTION_LAYOUT_TO_DIM = {
     "hsr11": 11,
-    "arm5": 5,
+    "arm6": 6,
 }
 STATE_DIM = 8
 
@@ -224,9 +224,13 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--action-layout", type=str, default=DEFAULT_ACTION_LAYOUT,
-                        choices=sorted(ACTION_LAYOUT_TO_DIM.keys()),
-                        help="Action layout preset. hsr11 is default, arm5 keeps only arm joints.")
+    parser.add_argument(
+        "--action-layout",
+        type=str,
+        default=DEFAULT_ACTION_LAYOUT,
+        choices=sorted(ACTION_LAYOUT_TO_DIM.keys()),
+        help="Action layout preset. hsr11 is default, arm6 keeps arm+gripper.",
+    )
     parser.add_argument("--action-dim", type=int, default=None,
                         help="Optional explicit action dimension override.")
     parser.add_argument("--log-level", type=str, default="INFO")

@@ -47,8 +47,9 @@ ACTION_LAYOUT_TO_GROUPS = {
         "head": slice(6, 8),
         "base": slice(8, 11),
     },
-    "arm5": {
+    "arm6": {
         "arm": slice(0, 5),
+        "gripper": slice(5, 6),
     },
 }
 
@@ -101,8 +102,8 @@ def evaluate(checkpoint_path, dataset_root, test_episodes, n_samples=240,
     # Imports are local so the module loads without lerobot installed
     # (e.g. when only the helpers above are used from a notebook).
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     action_groups = resolve_action_groups(action_layout)
     if action_dim is None:

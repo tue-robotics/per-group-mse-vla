@@ -33,29 +33,33 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ACTION_LAYOUT_TO_DIM = {
     "hsr11": 11,
-    "arm5": 5,
+    "arm6": 6,
 }
 
+# lerobot-train override key that sets the policy action-head width. The exact
+# key differs across LeRobot versions, so it is exposed via --action-dim-key.
+DEFAULT_ACTION_DIM_KEY = "policy.action_dim"
 
-def build_layout_overrides(action_layout: str, action_dim: int = None):
-    """Return extra lerobot-train overrides for action layout.
 
-    Default HSR11 path returns no overrides and preserves current behavior.
-    For non-default layouts this is intentionally conservative because exact
-    override keys can differ across LeRobot versions.
+def build_layout_overrides(
+    action_layout: str,
+    action_dim: int = None,
+    action_dim_key: str = DEFAULT_ACTION_DIM_KEY,
+):
+    """Return lerobot-train overrides that set the trained action-head width.
+
+    hsr11 (11 DoF) is native and returns no overrides, preserving the
+    retrain-from-checkpoint path. Reduced layouts (e.g. arm6) emit an explicit
+    action-dim override so the head trains to that width from scratch. A reduced
+    width also requires the dataset action to be sliced to match; pass any
+    version-specific dataset keys through --policy-override.
     """
     resolved_dim = action_dim if action_dim is not None else ACTION_LAYOUT_TO_DIM[action_layout]
     if action_layout == "hsr11" and resolved_dim == 11:
         return []
-
-    print("WARNING: Non-default action layout requested: "
-          f"layout={action_layout}, action_dim={resolved_dim}.")
-    print("WARNING: Verify the exact LeRobot override keys for your version. "
-          "Use --policy-override to pass validated keys.")
-    return []
+    return [f"--{action_dim_key}={resolved_dim}"]
 
 
 def validate_dataset(root: Path):
@@ -100,6 +104,13 @@ def main():
                         help="Action layout preset. hsr11 keeps current behavior.")
     parser.add_argument("--action-dim", type=int, default=None,
                         help="Optional explicit action dimension override.")
+    parser.add_argument(
+        "--action-dim-key",
+        type=str,
+        default=DEFAULT_ACTION_DIM_KEY,
+        help="lerobot-train key that sets the policy action-head width "
+        "(adapt to your LeRobot version).",
+    )
     parser.add_argument("--policy-override", action="append", default=[],
                         help="Extra raw lerobot-train overrides, repeatable.")
     parser.add_argument("--dry-run", action="store_true",
@@ -134,7 +145,9 @@ def main():
     if not args.no_amp:
         cmd.append("--policy.use_amp=true")
 
-    cmd.extend(build_layout_overrides(args.action_layout, args.action_dim))
+    cmd.extend(
+        build_layout_overrides(args.action_layout, args.action_dim, args.action_dim_key)
+    )
     cmd.extend(args.policy_override)
 
     if args.dry_run:
