@@ -17,11 +17,10 @@
 #       -p 8000:8000 \
 #       smolvla-policy-server
 #
-# The CUDA tag is pinned to a 12.x runtime base, which matches the
-# torch wheels we tested against (PyTorch 2.4 with cu121). If you bump
-# torch, bump CUDA in lockstep here.
+# Python 3.12 is required by LeRobot v0.5.1. The CUDA-enabled PyTorch wheel
+# supplies the model runtime; the host NVIDIA driver is exposed at run time.
 
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -29,31 +28,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_OFFLINE=0 \
     HF_HOME=/root/.cache/huggingface
 
-# Python 3.12 is the floor required by LeRobot v0.5.1.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common ca-certificates curl git \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-venv python3.12-dev \
-        ffmpeg libgl1 \
-    && rm -rf /var/lib/apt/lists/*
+# Install the CUDA-enabled PyTorch runtime first, then LeRobot and the small
+# set of WebSocket server dependencies.
+RUN python -m pip install --upgrade pip \
+    && python -m pip install \
+        "torch==2.4.*" --index-url https://download.pytorch.org/whl/cu121
 
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+RUN python -m pip install \
+        --no-deps \
+        "lerobot @ https://github.com/huggingface/lerobot/archive/refs/tags/v0.5.1.tar.gz"
 
-# Install LeRobot with the SmolVLA extras and the small set of deps that
-# this server needs on top of LeRobot. We pin Torch to the cu121 wheel
-# that matches the CUDA runtime above.
-RUN python3.12 -m pip install --upgrade pip \
-    && python3.12 -m pip install \
-        "torch==2.4.*" --index-url https://download.pytorch.org/whl/cu121 \
-    && python3.12 -m pip install \
-        "lerobot[smolvla] @ git+https://github.com/huggingface/lerobot@v0.5.1" \
-        websockets msgpack safetensors
+RUN python -m pip install \
+        accelerate av datasets diffusers draccus einops \
+        huggingface-hub imageio jsonlines mergedeep num2words \
+        opencv-python-headless packaging pyserial pyyaml \
+        safetensors "transformers==4.46.3" websockets msgpack \
+    && python -m pip install \
+        "torchvision==0.19.*" --index-url https://download.pytorch.org/whl/cu121
 
 # Pre-cache the SmolVLM-2 processor so the server can boot offline. This
 # avoids a first-call stall (and the occasional HF rate-limit) when the
 # container starts inside an evaluator without internet.
-RUN python3.12 -c "__import__('transformers').AutoProcessor.from_pretrained('HuggingFaceTB/SmolVLM2-500M-Video-Instruct')"
+RUN python -c "__import__('transformers').AutoProcessor.from_pretrained('HuggingFaceTB/SmolVLM2-500M-Video-Instruct')"
 
 WORKDIR /opt/policy
 COPY inference/policy_server.py /opt/policy/policy_server.py
@@ -61,7 +57,8 @@ COPY inference/policy_server.py /opt/policy/policy_server.py
 # The server expects the checkpoint to be mounted at /checkpoint by the
 # operator. The startup command reads $POLICY_CHECKPOINT_PATH so a
 # different mount point can be used without rebuilding the image.
-ENV POLICY_CHECKPOINT_PATH=/checkpoint
+ENV POLICY_CHECKPOINT_PATH=/checkpoint \
+    POLICY_STATE_INDICES=0,1,2,3,4,5
 EXPOSE 8000
 
-CMD ["sh", "-c", "python3.12 policy_server.py --checkpoint ${POLICY_CHECKPOINT_PATH} --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "python policy_server.py --checkpoint ${POLICY_CHECKPOINT_PATH} --host 0.0.0.0 --port 8000 --state-indices ${POLICY_STATE_INDICES}"]

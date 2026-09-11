@@ -284,12 +284,13 @@ async def handle(ws, server: Server):
 
 
 async def serve(checkpoint_dir: Path, host: str, port: int, device: str,
-                action_layout: str, action_dim: int = None):
+                action_layout: str, action_dim: int = None, state_indices=None):
     server = Server(
         checkpoint_dir,
         device=device,
         action_layout=action_layout,
         action_dim=action_dim,
+        state_indices=state_indices,
     )
     # 20 MB cap on incoming payloads. A pair of 480x640x3 uint8 frames is
     # ~1.8 MB raw, msgpack-packed lists are bigger but well below 20 MB.
@@ -315,6 +316,12 @@ def main():
     )
     parser.add_argument("--action-dim", type=int, default=None,
                         help="Optional explicit action dimension override.")
+    parser.add_argument(
+        "--state-indices",
+        type=str,
+        default="0,1,2,3,4,5",
+        help="Comma-separated source indices for the checkpoint state vector.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -322,6 +329,7 @@ def main():
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
     )
+    state_indices = [int(value) for value in args.state_indices.split(",") if value]
     asyncio.run(
         serve(
             Path(args.checkpoint),
@@ -330,6 +338,7 @@ def main():
             args.device,
             args.action_layout,
             args.action_dim,
+            state_indices,
         )
     )
 
