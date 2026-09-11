@@ -13,23 +13,23 @@ following keys.
 
     head_rgb     uint8 (480, 640, 3)   head camera frame
     hand_rgb     uint8 (480, 640, 3)   hand camera frame
-    state        float32 (8,)          5 arm + 1 gripper + 2 head, robot units
+    state        float32               robot state; dimensions are selected
+                                       from the checkpoint configuration
     instruction  str                   natural-language prompt
 
 It responds with
 
-    actions      float32 (T, 11)       T future actions, 11-DoF layout
+    actions      float32 (T, 11)       T future actions, 11-DoF layout, robot units
                                        arm(5) + gripper(1) + head(2) + base(3)
 
 The action chunk is what the policy emits in one forward pass, around 50
 steps at the configured action horizon. The client typically plays a
 prefix and asks for the next chunk before the prefix runs out.
 
-We deliberately avoid the full LeRobot inference pipeline at runtime,
-because keeping a six-step preprocessing pipeline in sync across LeRobot
-versions was fragile in practice. Instead we load the normalization
-statistics directly from the safetensors of the checkpoint and apply
-them in this file. The trade-off is documented in docs/CONTEXT.md.
+Modern checkpoints use the LeRobot preprocessor and postprocessor pipelines
+saved beside the model. This keeps image resizing, empty-camera insertion,
+tokenization and normalization aligned with the checkpoint. Older checkpoints
+without those pipeline files use the legacy tokenizer/statistics fallback.
 
 Run it with
 
@@ -42,6 +42,7 @@ and verify with `inference/smoke_test.py` before connecting any robot.
 
 import argparse
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
@@ -60,7 +61,7 @@ ACTION_LAYOUT_TO_DIM = {
     "hsr11": 11,
     "arm6": 6,
 }
-STATE_DIM = 8
+DEFAULT_STATE_DIM = 8
 
 # Tokenizer's attention_mask comes back as int64 on this code path.
 # SmolVLA's eager attention expects bool. See docs/CONTEXT.md ("attention_mask dtype").
@@ -136,21 +137,100 @@ def _img_to_tensor(img: np.ndarray, device: str) -> torch.Tensor:
     return t.permute(2, 0, 1).unsqueeze(0)
 
 
+def _img_to_frame_tensor(img: np.ndarray) -> torch.Tensor:
+    """Convert an HWC RGB observation to the unbatched LeRobot frame format."""
+    return torch.from_numpy(np.asarray(img, dtype=np.uint8)).permute(2, 0, 1)
+
+
+def _feature_dim(features: dict, name: str) -> int:
+    feature = features.get(name)
+    if feature is None:
+        return 0
+    shape = feature.shape if hasattr(feature, "shape") else feature.get("shape")
+    return int(shape[0])
+
+
 class Server:
     def __init__(self, checkpoint_dir: Path, device: str = "cuda",
-                 action_layout: str = DEFAULT_ACTION_LAYOUT, action_dim: int = None):
-        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-        from transformers import AutoTokenizer
+                 action_layout: str = DEFAULT_ACTION_LAYOUT, action_dim: int = None,
+                 state_indices=None):
+        from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
         self.device = device
-        self.policy = SmolVLAPolicy.from_pretrained(str(checkpoint_dir))
+        with open(checkpoint_dir / "config.json") as config_file:
+            checkpoint_config = json.load(config_file)
+
+        policy_type = checkpoint_config.get("type")
+        if not policy_type:
+            raise ValueError("Checkpoint config.json does not declare a policy 'type'")
+
+        policy_cls = get_policy_class(policy_type)
+        self.policy = policy_cls.from_pretrained(str(checkpoint_dir))
         self.policy.eval().to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir))
-        self.stats = load_norm_stats(checkpoint_dir)
         self.action_layout = action_layout
-        self.action_dim = resolve_action_dim(action_layout, action_dim)
-        LOG.info("Policy server ready on %s with action_layout=%s action_dim=%d",
-             device, self.action_layout, self.action_dim)
+        input_features = getattr(self.policy.config, "input_features", {})
+        output_features = getattr(self.policy.config, "output_features", {})
+        self.state_dim = _feature_dim(input_features, "observation.state") or DEFAULT_STATE_DIM
+        model_action_dim = _feature_dim(output_features, "action")
+        self.action_dim = int(action_dim or model_action_dim or resolve_action_dim(action_layout))
+        self.state_indices = None if state_indices is None else tuple(int(i) for i in state_indices)
+
+        self.preprocessor = None
+        self.postprocessor = None
+        processor_files = (
+            checkpoint_dir / "policy_preprocessor.json",
+            checkpoint_dir / "policy_postprocessor.json",
+        )
+        if all(path.exists() for path in processor_files):
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                policy_cfg=self.policy.config,
+                pretrained_path=str(checkpoint_dir),
+            )
+            LOG.info("Loaded checkpoint-defined LeRobot pre/postprocessors")
+        else:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir))
+            self.stats = load_norm_stats(checkpoint_dir)
+            LOG.info("Loaded legacy normalization statistics")
+
+        LOG.info("Policy server ready on %s with policy=%s state_dim=%d action_dim=%d",
+                 device, policy_type, self.state_dim, self.action_dim)
+
+    def _select_state(self, state: np.ndarray) -> np.ndarray:
+        if self.state_indices is not None:
+            if len(self.state_indices) != self.state_dim:
+                raise ValueError(
+                    "state_indices has length {}, checkpoint expects {} values".format(
+                        len(self.state_indices), self.state_dim
+                    )
+                )
+            try:
+                return state[list(self.state_indices)]
+            except IndexError as error:
+                raise ValueError("state_indices contains an index outside the robot state") from error
+        if state.shape == (self.state_dim,):
+            return state
+        raise ValueError(
+            "Checkpoint expects {} state values but the robot supplied {}. "
+            "Configure state_indices for the model layout.".format(self.state_dim, state.size)
+        )
+
+    def _infer_with_processors(self, head_rgb, hand_rgb, state, instruction):
+        frame = {
+            "observation.image.head": _img_to_frame_tensor(head_rgb),
+            "observation.image.hand": _img_to_frame_tensor(hand_rgb),
+            "observation.state": torch.from_numpy(state),
+            "task": instruction,
+        }
+        batch = self.preprocessor(frame)
+        prediction = self.policy.predict_action_chunk(batch)
+        actions = self.postprocessor(prediction[0])
+        if isinstance(actions, dict):
+            actions = actions.get("action")
+        if actions is None:
+            raise ValueError("Checkpoint postprocessor did not return an action tensor")
+        return actions.detach().cpu().numpy()
 
     @torch.no_grad()
     def infer(self, obs: dict) -> np.ndarray:
@@ -159,8 +239,10 @@ class Server:
         hand_rgb = np.asarray(obs["hand_rgb"], dtype=np.uint8)
         state = np.asarray(obs["state"], dtype=np.float32)
         instruction = str(obs.get("instruction", ""))
-        if state.shape != (STATE_DIM,):
-            raise ValueError(f"state must be shape ({STATE_DIM},), got {state.shape}")
+        state = self._select_state(state)
+
+        if self.preprocessor is not None:
+            return self._infer_with_processors(head_rgb, hand_rgb, state, instruction).astype(np.float32)
 
         state_norm = normalize_state(state, self.stats).astype(np.float32)
         enc = self.tokenizer(instruction, return_tensors="pt",
