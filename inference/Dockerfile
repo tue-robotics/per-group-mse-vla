@@ -32,19 +32,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # set of WebSocket server dependencies.
 RUN python -m pip install --upgrade pip \
     && python -m pip install \
-        "torch==2.4.*" --index-url https://download.pytorch.org/whl/cu121
+        "torch==2.7.*" --index-url https://download.pytorch.org/whl/cu118
 
 RUN python -m pip install \
         --no-deps \
         "lerobot @ https://github.com/huggingface/lerobot/archive/refs/tags/v0.5.1.tar.gz"
 
 RUN python -m pip install \
-        accelerate av datasets diffusers draccus einops \
+    accelerate av datasets deepdiff diffusers draccus einops gymnasium \
         huggingface-hub imageio jsonlines mergedeep num2words \
         opencv-python-headless packaging pyserial pyyaml \
-        safetensors "transformers==4.46.3" websockets msgpack \
+        safetensors "transformers==5.3.0" websockets msgpack \
     && python -m pip install \
-        "torchvision==0.19.*" --index-url https://download.pytorch.org/whl/cu121
+        "torchvision==0.22.*" --index-url https://download.pytorch.org/whl/cu118
 
 # Pre-cache the SmolVLM-2 processor so the server can boot offline. This
 # avoids a first-call stall (and the occasional HF rate-limit) when the
