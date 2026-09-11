@@ -11,13 +11,15 @@ redistributed here (see `docs/CONTEXT.md`). What follows is an
 implementation written from scratch, kept small enough to read end to
 end.
 
-The directory contains three files. `policy_server.py` loads a SmolVLA
+The directory contains four files. `policy_server.py` loads a SmolVLA
 checkpoint, reads the normalization statistics directly from the
 checkpoint's safetensors (the choice explained in `docs/CONTEXT.md`),
 accepts msgpack-encoded observations on a WebSocket, and returns the
 predicted action chunk in the 11-DoF HSR layout. `smoke_test.py` is a
 synthetic client that sends a zeros observation, checks the response
 shape, finiteness and per-joint ranges, and reports per-call latency.
+`local_smoke_test.py` loads the checkpoint and performs one direct GPU
+inference before a policy server, ROS, or robot is involved.
 `Dockerfile` builds a CUDA 12 + Python 3.12 + LeRobot v0.5.1 image
 with the SmolVLM processor pre-cached so the server can boot offline.
 
@@ -45,16 +47,37 @@ the exit names which assertion fired.
 
 ```bash
 docker build -f inference/Dockerfile -t smolvla-policy-server .
-docker run --rm --runtime=nvidia --gpus all \
-    -v /path/to/pretrained_model:/checkpoint \
+docker run --rm --gpus all \
+    -v /path/to/huggingface-model-cache:/model-cache:ro \
+    -e POLICY_CHECKPOINT_PATH=/model-cache/snapshots/<snapshot-id> \
     -p 8000:8000 \
     smolvla-policy-server
 ```
 
-The container exposes port 8000 and expects the checkpoint to be
-mounted at `/checkpoint`. `--runtime=nvidia` is mandatory. The default
-`runc` will not pick the GPU and the server will fall back to CPU, at
-which point inference takes seconds and the smoke test times out.
+Mount the complete Hugging Face model cache, rather than its `snapshots`
+subdirectory: checkpoint files link into the cache's `blobs` directory.
+The container exposes port 8000. Add `--runtime=nvidia` only on hosts that
+require it in addition to `--gpus all`.
+
+## Pre-robot checkpoint test
+
+This command evaluates the deployable inference path without ROS, GPSR,
+cameras, or robot actuation:
+
+```bash
+docker run --rm --gpus all \
+    -v /home/amigo/.cache/huggingface/hub/models--PauMontagut--per-group-mse-smolvla:/model-cache:ro \
+    smolvla-policy-server \
+    python /opt/policy/local_smoke_test.py \
+    --checkpoint /model-cache/snapshots/cb72ca6a3a58e724a3ca8579bea3811f1810be96
+```
+
+Success prints `PASS` with a finite `actions_shape=(50, 11)`. This verifies
+CUDA access, model loading, the checkpoint's processors and normalization,
+state selection, image preprocessing, and one action-chunk prediction. It
+does not prove that live ROS camera observations, arm calibration, collision
+behavior, or task completion will succeed. Run `smoke_test.py` against the
+running WebSocket server next to validate the network boundary.
 
 ## I/O contract
 

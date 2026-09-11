@@ -139,7 +139,12 @@ def _img_to_tensor(img: np.ndarray, device: str) -> torch.Tensor:
 
 def _img_to_frame_tensor(img: np.ndarray) -> torch.Tensor:
     """Convert an HWC RGB observation to the unbatched LeRobot frame format."""
-    return torch.from_numpy(np.asarray(img, dtype=np.uint8)).permute(2, 0, 1)
+    return (
+        torch.from_numpy(np.asarray(img, dtype=np.uint8))
+        .permute(2, 0, 1)
+        .float()
+        .div(255.0)
+    )
 
 
 def _feature_dim(features: dict, name: str) -> int:
@@ -186,6 +191,7 @@ class Server:
                 policy_cfg=self.policy.config,
                 pretrained_path=str(checkpoint_dir),
             )
+            self._align_processor_state_statistics()
             LOG.info("Loaded checkpoint-defined LeRobot pre/postprocessors")
         else:
             from transformers import AutoTokenizer
@@ -196,6 +202,19 @@ class Server:
 
         LOG.info("Policy server ready on %s with policy=%s state_dim=%d action_dim=%d",
                  device, policy_type, self.state_dim, self.action_dim)
+
+    def _align_processor_state_statistics(self) -> None:
+        """Trim stale checkpoint state statistics to the declared model dimension."""
+        for processor_step in self.preprocessor.steps:
+            stats = getattr(processor_step, "stats", None)
+            if not isinstance(stats, dict):
+                continue
+            state_stats = stats.get("observation.state")
+            if not isinstance(state_stats, dict):
+                continue
+            for name, value in state_stats.items():
+                if hasattr(value, "shape") and value.shape and value.shape[-1] > self.state_dim:
+                    state_stats[name] = value[..., : self.state_dim]
 
     def _select_state(self, state: np.ndarray) -> np.ndarray:
         if self.state_indices is not None:

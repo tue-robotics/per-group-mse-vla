@@ -53,6 +53,7 @@ RUN python -c "__import__('transformers').AutoProcessor.from_pretrained('Hugging
 
 WORKDIR /opt/policy
 COPY inference/policy_server.py /opt/policy/policy_server.py
+COPY inference/local_smoke_test.py /opt/policy/local_smoke_test.py
 
 # The server expects the checkpoint to be mounted at /checkpoint by the
 # operator. The startup command reads $POLICY_CHECKPOINT_PATH so a
