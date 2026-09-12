@@ -155,6 +155,22 @@ def _feature_dim(features: dict, name: str) -> int:
     return int(shape[0])
 
 
+def _decode_image(value) -> np.ndarray:
+    """Decode compact binary images, while accepting the legacy list format."""
+    if isinstance(value, dict) and "data" in value and "shape" in value:
+        shape = tuple(int(dimension) for dimension in value["shape"])
+        image = np.frombuffer(value["data"], dtype=np.uint8)
+        expected_size = int(np.prod(shape))
+        if image.size != expected_size:
+            raise ValueError(
+                "Image payload has {} bytes, expected {} for shape {}".format(
+                    image.size, expected_size, shape
+                )
+            )
+        return image.reshape(shape)
+    return np.asarray(value, dtype=np.uint8)
+
+
 class Server:
     def __init__(self, checkpoint_dir: Path, device: str = "cuda",
                  action_layout: str = DEFAULT_ACTION_LAYOUT, action_dim: int = None,
@@ -254,8 +270,8 @@ class Server:
     @torch.no_grad()
     def infer(self, obs: dict) -> np.ndarray:
         """One forward pass. Returns (T, action_dim) float32 in robot units."""
-        head_rgb = np.asarray(obs["head_rgb"], dtype=np.uint8)
-        hand_rgb = np.asarray(obs["hand_rgb"], dtype=np.uint8)
+        head_rgb = _decode_image(obs["head_rgb"])
+        hand_rgb = _decode_image(obs["hand_rgb"])
         state = np.asarray(obs["state"], dtype=np.float32)
         instruction = str(obs.get("instruction", ""))
         state = self._select_state(state)
@@ -292,7 +308,10 @@ async def handle(ws, server: Server):
         t0 = time.perf_counter()
         try:
             obs = msgpack.unpackb(message, raw=False)
-            actions = server.infer(obs)
+            # Model inference is synchronous and can take longer than the
+            # WebSocket keepalive interval. Keep it off the event loop so
+            # pings and connection management remain responsive.
+            actions = await asyncio.to_thread(server.infer, obs)
             response = {"actions": actions.tolist()}
             latency_ms = (time.perf_counter() - t0) * 1000
             LOG.info("Inference OK, chunk shape %s, %.1f ms", actions.shape, latency_ms)

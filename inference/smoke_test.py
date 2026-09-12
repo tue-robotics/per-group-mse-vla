@@ -27,9 +27,14 @@ import numpy as np
 import websockets
 
 
+def _pack_image(image):
+    image = np.ascontiguousarray(image, dtype=np.uint8)
+    return {"data": image.tobytes(), "shape": image.shape}
+
+
 SYNTHETIC_OBS = {
-    "head_rgb": np.zeros((480, 640, 3), dtype=np.uint8).tolist(),
-    "hand_rgb": np.zeros((480, 640, 3), dtype=np.uint8).tolist(),
+    "head_rgb": _pack_image(np.zeros((480, 640, 3), dtype=np.uint8)),
+    "hand_rgb": _pack_image(np.zeros((480, 640, 3), dtype=np.uint8)),
     "state": [0.0] * 8,
     "instruction": "pick up the mug",
 }
